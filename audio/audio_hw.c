@@ -123,7 +123,7 @@ struct pcm_config pcm_config_mm = {
 #ifdef AM335XEVM
     .period_count = 16,
 #else
-    .period_count = PLAYBACK_PERIOD_COUNT
+    .period_count = PLAYBACK_PERIOD_COUNT,
 #endif
     .format = PCM_FORMAT_S16_LE,
 };
