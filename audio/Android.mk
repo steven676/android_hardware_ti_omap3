@@ -20,6 +20,8 @@ ifneq (,$(findstring omap3evm, $(TARGET_PRODUCT)))
     LOCAL_MODULE := audio.primary.omap3evm
 else ifneq (,$(findstring beagleboard, $(TARGET_PRODUCT)))
     LOCAL_MODULE := audio.primary.beagleboard
+else ifneq (,$(findstring flashboard, $(TARGET_PRODUCT)))
+    LOCAL_MODULE := audio.primary.flashboard
 else ifneq (,$(findstring am335xevm, $(TARGET_PRODUCT)))
     LOCAL_MODULE := audio.primary.am335xevm
     LOCAL_CFLAGS += -DAM335XEVM
