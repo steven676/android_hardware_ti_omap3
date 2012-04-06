@@ -186,6 +186,12 @@ struct route_setting defaults[] = {
 
 struct route_setting speaker[] = {
 
+#ifdef AM335XEVM
+    {
+        .ctl_name = MIXER_HEADSET_PLAYBACK_VOLUME,
+        .intval = 127,
+    },
+#else
     {
         .ctl_name = MIXER_HEADSETR_AUDIO_R2,
         .intval = 1,
@@ -196,7 +202,7 @@ struct route_setting speaker[] = {
     },
     {
         .ctl_name = MIXER_HEADSET_PLAYBACK_VOLUME,
-        .intval = 1,
+        .intval = 3,
     },
     {
         .ctl_name = MIXER_ANALOG_LEFT_AUXL_CAPTURE_SWITCH,
@@ -205,6 +211,7 @@ struct route_setting speaker[] = {
     {
         .ctl_name = NULL,
     },
+#endif
 
 };
 
