@@ -78,6 +78,10 @@ CameraHardware::CameraHardware()
 {
 	/* create camera */
 	mCamera = new V4L2Camera();
+	#ifdef _USE_USB_CAMERA_
+	mCamera->Open(VIDEO_DEVICE_0);  /*USB camera use this node*/
+
+	#else
 	version = get_kernel_version();
 	if(version <= 0)
 		LOGE("Failed to parse kernel version\n");
@@ -91,6 +95,7 @@ CameraHardware::CameraHardware()
 	{
 		mCamera->Open(VIDEO_DEVICE_0);
 	}
+	#endif
 
 	initDefaultParameters();
         mNativeWindow=NULL;
