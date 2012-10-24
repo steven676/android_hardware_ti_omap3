@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 Texas Instruments
+ * Copyright (C) 2012 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,632 +12,616 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
- * This module is a derived work from the original contribution of
- * the /device/samsung/tuna/audio/audio_hw.c by Simon Wilson
- *
  */
 
 #define LOG_TAG "audio_hw_primary"
-//#define LOG_NDEBUG 0
-//#define LOG_NDEBUG_FUNCTION
-#ifndef LOG_NDEBUG_FUNCTION
-#define LOGFUNC(...) ((void)0)
-#else
-#define LOGFUNC(...) (LOGV(__VA_ARGS__))
-#endif
-
+/*#define LOG_NDEBUG 0*/
 
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <sys/time.h>
 #include <stdlib.h>
+#include <sys/time.h>
 
 #include <cutils/log.h>
-#include <cutils/str_parms.h>
 #include <cutils/properties.h>
+#include <cutils/str_parms.h>
 
-#include <hardware/hardware.h>
-#include <system/audio.h>
 #include <hardware/audio.h>
+#include <hardware/hardware.h>
+
+#include <system/audio.h>
 
 #include <tinyalsa/asoundlib.h>
+
 #include <audio_utils/resampler.h>
-#include <audio_utils/echo_reference.h>
-#include <hardware/audio_effect.h>
-#include <audio_effects/effect_aec.h>
 
+#include "audio_route.h"
 
-/*omap3 alsa controls*/
-#define MIXER_HEADSETR_AUDIO_R2                "HeadsetR Mixer AudioR2"
-#define MIXER_HEADSETL_AUDIO_L2                "HeadsetL Mixer AudioL2"
-#define MIXER_ANALOG_LEFT_AUXL_CAPTURE_SWITCH  "Analog Left AUXL Capture Switch"
-#define MIXER_ANALOG_RIGHT_AUXL_CAPTURE_SWITCH "Analog Right AUXR Capture Switch"
-#define MIXER_ANALOG_CAPTURE_VOLUME             "Analog Capture Volume"
+#define PCM_CARD 0
+#define PCM_DEVICE 0
+#define PCM_DEVICE_SCO 2
 
-#ifdef AM335XEVM
-#define MIXER_HEADSET_PLAYBACK_VOLUME 	       "PCM Playback Volume"
-#else
-#define MIXER_HEADSET_PLAYBACK_VOLUME 	       "Headset Playback Volume"
-#endif
+#define OUT_PERIOD_SIZE 880
+#define OUT_SHORT_PERIOD_COUNT 2
+#define OUT_LONG_PERIOD_COUNT 8
+#define OUT_SAMPLING_RATE 44100
 
-/* Mixer control gain and route values */
-#define MIXER_ABE_GAIN_0DB                  120
+#define IN_PERIOD_SIZE 1024
+#define IN_PERIOD_COUNT 4
+#define IN_SAMPLING_RATE 44100
 
-#define CARD_OMAP3_DEFAULT 0
-#define PORT_OMAP3 0
+#define SCO_PERIOD_SIZE 256
+#define SCO_PERIOD_COUNT 4
+#define SCO_SAMPLING_RATE 8000
 
-/* constraint imposed by ABE for CBPr mode: all period sizes must be multiples of 24 */
-#define ABE_BASE_FRAME_COUNT 24
-/* number of base blocks in a short period (low latency) */
-#define SHORT_PERIOD_MULTIPLIER 80  /* 40 ms */
-/* number of frames per short period (low latency) */
-#define SHORT_PERIOD_SIZE (ABE_BASE_FRAME_COUNT * SHORT_PERIOD_MULTIPLIER)
-/* number of short periods in a long period (low power) */
-#define LONG_PERIOD_MULTIPLIER 1  /* 40 ms */
-/* number of frames per long period (low power) */
-#define LONG_PERIOD_SIZE (SHORT_PERIOD_SIZE * LONG_PERIOD_MULTIPLIER)
-/* number of periods for playback */
-#define PLAYBACK_PERIOD_COUNT 4
-/* number of periods for capture */
-#define CAPTURE_PERIOD_COUNT 2
 /* minimum sleep time in out_write() when write threshold is not reached */
-#define MIN_WRITE_SLEEP_US 5000
+#define MIN_WRITE_SLEEP_US 2000
+#define MAX_WRITE_SLEEP_US ((OUT_PERIOD_SIZE * OUT_SHORT_PERIOD_COUNT * 1000000) \
+                                / OUT_SAMPLING_RATE)
 
-#define RESAMPLER_BUFFER_FRAMES (SHORT_PERIOD_SIZE * 2)
-#define RESAMPLER_BUFFER_SIZE (4 * RESAMPLER_BUFFER_FRAMES)
+enum {
+    OUT_BUFFER_TYPE_UNKNOWN,
+    OUT_BUFFER_TYPE_SHORT,
+    OUT_BUFFER_TYPE_LONG,
+};
 
-#define DEFAULT_OUT_SAMPLING_RATE 44100
-
-/* sampling rate when using MM low power port */
-#define MM_LOW_POWER_SAMPLING_RATE 44100
-/* sampling rate when using MM full power port */
-#define MM_FULL_POWER_SAMPLING_RATE 48000
-/* sampling rate when using VX port for narrow band */
-#define VX_NB_SAMPLING_RATE 8000
-/* sampling rate when using VX port for wide band */
-#define VX_WB_SAMPLING_RATE 16000
-
-/* conversions from dB to ABE and codec gains */
-#define DB_TO_ABE_GAIN(x) ((x) + MIXER_ABE_GAIN_0DB)
-#define DB_TO_CAPTURE_PREAMPLIFIER_VOLUME(x) (((x) + 6) / 6)
-#define DB_TO_CAPTURE_VOLUME(x) (((x) - 6) / 6)
-#define DB_TO_HEADSET_VOLUME(x) (((x) + 30) / 2)
-#define DB_TO_SPEAKER_VOLUME(x) (((x) + 52) / 2)
-#define DB_TO_EARPIECE_VOLUME(x) (((x) + 24) / 2)
-
-
-#define HEADSET_VOLUME                        0
-#define HEADPHONE_VOLUME                      0 /* allow louder output for headphones */
-
-/* product-specific defines */
-#define PRODUCT_DEVICE_PROPERTY "ro.product.device"
-#define PRODUCT_DEVICE_TYPE    "omap3evm"
-
-
-struct pcm_config pcm_config_mm = {
+struct pcm_config pcm_config_out = {
     .channels = 2,
-    .rate = DEFAULT_OUT_SAMPLING_RATE,
-    .period_size = LONG_PERIOD_SIZE,
+    .rate = OUT_SAMPLING_RATE,
+    .period_size = OUT_PERIOD_SIZE,
 #ifdef AM335XEVM
     .period_count = 16,
 #else
-    .period_count = PLAYBACK_PERIOD_COUNT,
+    .period_count = OUT_LONG_PERIOD_COUNT,
 #endif
+    .format = PCM_FORMAT_S16_LE,
+    .start_threshold = OUT_PERIOD_SIZE * OUT_SHORT_PERIOD_COUNT,
+};
+
+struct pcm_config pcm_config_in = {
+    .channels = 2,
+    .rate = IN_SAMPLING_RATE,
+    .period_size = IN_PERIOD_SIZE,
+#ifdef AM335XEVM
+    .period_count = 16,
+#else
+    .period_count = IN_PERIOD_COUNT,
+#endif
+    .format = PCM_FORMAT_S16_LE,
+    .start_threshold = 1,
+    .stop_threshold = (IN_PERIOD_SIZE * IN_PERIOD_COUNT),
+};
+
+struct pcm_config pcm_config_sco = {
+    .channels = 1,
+    .rate = SCO_SAMPLING_RATE,
+    .period_size = SCO_PERIOD_SIZE,
+    .period_count = SCO_PERIOD_COUNT,
     .format = PCM_FORMAT_S16_LE,
 };
 
-
-struct pcm_config pcm_config_mm_ul = {
-    .channels = 2,
-    .rate = 8000,
-    .period_size = 1024,
-#ifdef AM335XEVM
-    .period_count = 16,
-#else
-    .period_count = 16,
-#endif
-    .format = PCM_FORMAT_S16_LE,
-};
-
-
-#define MIN(x, y) ((x) > (y) ? (y) : (x))
-
-struct route_setting
-{
-    char *ctl_name;
-    int intval;
-    char *strval;
-};
-
-struct route_setting defaults[] = {
-    /* general */
-
-    {
-        .ctl_name = MIXER_HEADSETR_AUDIO_R2,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_HEADSETL_AUDIO_L2,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_HEADSET_PLAYBACK_VOLUME,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_LEFT_AUXL_CAPTURE_SWITCH,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_RIGHT_AUXL_CAPTURE_SWITCH,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_CAPTURE_VOLUME,
-        .intval = 0,
-    },
-    {
-        .ctl_name = NULL,
-    },
-
-};
-
-struct route_setting speaker[] = {
-
-#ifdef AM335XEVM
-    {
-        .ctl_name = MIXER_HEADSET_PLAYBACK_VOLUME,
-        .intval = 127,
-    },
-#else
-    {
-        .ctl_name = MIXER_HEADSETR_AUDIO_R2,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_HEADSETL_AUDIO_L2,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_HEADSET_PLAYBACK_VOLUME,
-        .intval = 3,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_LEFT_AUXL_CAPTURE_SWITCH,
-        .intval = 1,
-    },
-    {
-        .ctl_name = NULL,
-    },
-#endif
-
-};
-
-struct route_setting builtin_mic[] = {
-
-    {
-        .ctl_name = MIXER_ANALOG_LEFT_AUXL_CAPTURE_SWITCH,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_RIGHT_AUXL_CAPTURE_SWITCH,
-        .intval = 1,
-    },
-    {
-        .ctl_name = MIXER_ANALOG_CAPTURE_VOLUME,
-        .intval = 0,
-    },
-    {
-        .ctl_name = NULL,
-    },
-
-};
-
-
-
-struct mixer_ctls
-{
-    struct mixer_ctl *headset_volume;
-};
-
-struct omap3_audio_device {
+struct audio_device {
     struct audio_hw_device hw_device;
 
-    pthread_mutex_t lock;       /* see note below on mutex acquisition order */
-    struct mixer *mixer;
-    struct mixer_ctls mixer_ctls;
-    int mode;
-    int devices;
-    float voice_volume;
-    struct omap3_stream_in *active_input;
-    struct omap3_stream_out *active_output;
+    pthread_mutex_t lock; /* see note below on mutex acquisition order */
+    unsigned int devices;
+    bool standby;
     bool mic_mute;
+    struct audio_route *ar;
+    int orientation;
+    bool screen_off;
 
+    struct stream_out *active_out;
+    struct stream_in *active_in;
 };
 
-struct omap3_stream_out {
+struct stream_out {
     struct audio_stream_out stream;
 
-    pthread_mutex_t lock;       /* see note below on mutex acquisition order */
-    struct pcm_config config;
+    pthread_mutex_t lock; /* see note below on mutex acquisition order */
     struct pcm *pcm;
-    char *buffer;
-    int standby;
-    int write_threshold;
+    struct pcm_config *pcm_config;
+    bool standby;
 
-    struct omap3_audio_device *dev;
+    struct resampler_itfe *resampler;
+    int16_t *buffer;
+    size_t buffer_frames;
+
+    int write_threshold;
+    int cur_write_threshold;
+    int buffer_type;
+
+    struct audio_device *dev;
 };
 
-#define MAX_PREPROCESSORS 3 /* maximum one AGC + one NS + one AEC per input stream */
-
-struct omap3_stream_in {
+struct stream_in {
     struct audio_stream_in stream;
 
-    pthread_mutex_t lock;       /* see note below on mutex acquisition order */
-    struct pcm_config config;
+    pthread_mutex_t lock; /* see note below on mutex acquisition order */
     struct pcm *pcm;
-    int device;
-    int16_t *buffer;
-    size_t frames_in;
-    unsigned int requested_rate;
-    int standby;
-    int source;
+    struct pcm_config *pcm_config;
+    bool standby;
 
-    struct omap3_audio_device *dev;
+    unsigned int requested_rate;
+    struct resampler_itfe *resampler;
+    struct resampler_buffer_provider buf_provider;
+    int16_t *buffer;
+    size_t buffer_size;
+    size_t frames_in;
+    int read_status;
+
+    struct audio_device *dev;
 };
 
-/**
- * NOTE: when multiple mutexes have to be acquired, always respect the following order:
- *        hw device > in stream > out stream
+enum {
+    ORIENTATION_LANDSCAPE,
+    ORIENTATION_PORTRAIT,
+    ORIENTATION_SQUARE,
+    ORIENTATION_UNDEFINED,
+};
+
+static uint32_t out_get_sample_rate(const struct audio_stream *stream);
+static size_t out_get_buffer_size(const struct audio_stream *stream);
+static audio_format_t out_get_format(const struct audio_stream *stream);
+static uint32_t in_get_sample_rate(const struct audio_stream *stream);
+static size_t in_get_buffer_size(const struct audio_stream *stream);
+static audio_format_t in_get_format(const struct audio_stream *stream);
+static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
+                                   struct resampler_buffer* buffer);
+static void release_buffer(struct resampler_buffer_provider *buffer_provider,
+                                  struct resampler_buffer* buffer);
+
+/*
+ * NOTE: when multiple mutexes have to be acquired, always take the
+ * audio_device mutex first, followed by the stream_in and/or
+ * stream_out mutexes.
  */
 
+/* Helper functions */
 
-static void select_output_device(struct omap3_audio_device *adev);
-static void select_input_device(struct omap3_audio_device *adev);
-static int adev_set_voice_volume(struct audio_hw_device *dev, float volume);
-static int do_input_standby(struct omap3_stream_in *in);
-static int do_output_standby(struct omap3_stream_out *out);
-
-static int get_boardtype(struct omap3_audio_device *adev)
+static void select_devices(struct audio_device *adev)
 {
-    char board[PROPERTY_VALUE_MAX];
-    int status = 0;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-
-    return 0;
-}
-/* The enable flag when 0 makes the assumption that enums are disabled by
- * "Off" and integers/booleans by 0 */
-
-static int set_route_by_array(struct mixer *mixer, struct route_setting *route,
-                              int enable)
-{
-    struct mixer_ctl *ctl;
-    unsigned int i, j;
-
-    LOGFUNC("%s(%p, %p, %d)", __FUNCTION__, mixer, route, enable);
-
-    /* Go through the route array and set each value */
-    i = 0;
-    while (route[i].ctl_name) {
-        ctl = mixer_get_ctl_by_name(mixer, route[i].ctl_name);
-        if (!ctl)
-            return -EINVAL;
-	LOGE("Route MIXER CTRL name: %s", route[i].ctl_name);
-        if (route[i].strval) {
-            if (enable)
-                mixer_ctl_set_enum_by_string(ctl, route[i].strval);
-            else
-                mixer_ctl_set_enum_by_string(ctl, "Off");
-        } else {
-            /* This ensures multiple (i.e. stereo) values are set jointly */
-            for (j = 0; j < mixer_ctl_get_num_values(ctl); j++) {
-                if (enable)
-                    mixer_ctl_set_value(ctl, j, route[i].intval);
-                else
-                    mixer_ctl_set_value(ctl, j, 0);
-            }
-        }
-        i++;
-    }
-
-    return 0;
-}
-
-
-static void set_eq_filter(struct omap3_audio_device *adev)
-{
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-}
-
-
-static void set_output_volumes(struct omap3_audio_device *adev)
-{
-    unsigned int channel;
-    int headset_volume;
-
-    headset_volume = adev->devices & AUDIO_DEVICE_OUT_WIRED_HEADSET ?
-                                                        HEADSET_VOLUME :
-                                                        HEADPHONE_VOLUME;
-
-    for (channel = 0; channel < 2; channel++) {
-        mixer_ctl_set_value(adev->mixer_ctls.headset_volume, channel,
-            DB_TO_HEADSET_VOLUME(headset_volume));
-    }
-}
-
-static void force_all_standby(struct omap3_audio_device *adev)
-{
-    struct omap3_stream_in *in;
-    struct omap3_stream_out *out;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-
-    if (adev->active_output) {
-        out = adev->active_output;
-        pthread_mutex_lock(&out->lock);
-        do_output_standby(out);
-        pthread_mutex_unlock(&out->lock);
-    }
-    if (adev->active_input) {
-        in = adev->active_input;
-        pthread_mutex_lock(&in->lock);
-        do_input_standby(in);
-        pthread_mutex_unlock(&in->lock);
-    }
-}
-
-static void select_output_device(struct omap3_audio_device *adev)
-{
-    int headset_on;
     int headphone_on;
     int speaker_on;
-    int earpiece_on;
-    int bt_on;
-    int dl1_on;
-    int sidetone_capture_on = 0;
-    unsigned int channel, voice_ul_volume[2];
+    int main_mic_on;
 
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-
+    headphone_on = adev->devices & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE);
     speaker_on = adev->devices & AUDIO_DEVICE_OUT_SPEAKER;
-
-    set_route_by_array(adev->mixer, speaker, speaker_on);
-
-}
-
-static void select_input_device(struct omap3_audio_device *adev)
-{
-    int main_mic_on = 0;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-
     main_mic_on = adev->devices & AUDIO_DEVICE_IN_BUILTIN_MIC;
-    set_route_by_array(adev->mixer, builtin_mic , main_mic_on);
 
+    reset_mixer_state(adev->ar);
+
+    if (speaker_on)
+        audio_route_apply_path(adev->ar, "speaker");
+    if (headphone_on)
+        audio_route_apply_path(adev->ar, "headphone");
+    if (main_mic_on) {
+        audio_route_apply_path(adev->ar, "main-mic");
+    }
+
+    update_mixer_state(adev->ar);
+
+    ALOGV("hp=%c speaker=%c main-mic=%c", headphone_on ? 'y' : 'n',
+          speaker_on ? 'y' : 'n', main_mic_on ? 'y' : 'n');
 }
 
 /* must be called with hw device and output stream mutexes locked */
-static int start_output_stream(struct omap3_stream_out *out)
+static void do_out_standby(struct stream_out *out)
 {
-    struct omap3_audio_device *adev = out->dev;
-    unsigned int card = CARD_OMAP3_DEFAULT;
-    unsigned int port = PORT_OMAP3;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, adev);
-
-    adev->active_output = out;
-
-    select_output_device(adev);
-
-    out->write_threshold = PLAYBACK_PERIOD_COUNT * LONG_PERIOD_SIZE;
-    out->config.start_threshold = SHORT_PERIOD_SIZE * 2;
-    out->config.avail_min = LONG_PERIOD_SIZE,
-
-
-    out->pcm = pcm_open(card, port, PCM_OUT | PCM_MMAP, &out->config);
-
-    if (!pcm_is_ready(out->pcm)) {
-        LOGE("cannot open pcm_out driver: %s", pcm_get_error(out->pcm));
-        pcm_close(out->pcm);
-        adev->active_output = NULL;
-        return -ENOMEM;
-    }
-
-    return 0;
-}
-
-static int check_input_parameters(uint32_t sample_rate, int format, int channel_count)
-{
-    LOGFUNC("%s(%d, %d, %d)", __FUNCTION__, sample_rate, format, channel_count);
-
-    if (format != AUDIO_FORMAT_PCM_16_BIT) {
-        return -EINVAL;
-    }
-
-    if ((channel_count < 1) || (channel_count > 2)) {
-        return -EINVAL;
-    }
-
-    switch(sample_rate) {
-    case 8000:
-    case 11025:
-    case 16000:
-    case 22050:
-    case 24000:
-    case 32000:
-    case 44100:
-    case 48000:
-        break;
-    default:
-        return -EINVAL;
-    }
-
-    return 0;
-}
-
-static size_t get_input_buffer_size(uint32_t sample_rate, int format, int channel_count)
-{
-    size_t size;
-    size_t device_rate;
-
-    LOGFUNC("%s(%d, %d, %d)", __FUNCTION__, sample_rate, format, channel_count);
-
-    if (check_input_parameters(sample_rate, format, channel_count) != 0)
-        return 0;
-
-    /* take resampling into account and return the closest majoring
-    multiple of 16 frames, as audioflinger expects audio buffers to
-    be a multiple of 16 frames */
-    size = (pcm_config_mm_ul.period_size * sample_rate) / pcm_config_mm_ul.rate;
-    size = ((size + 15) / 16) * 16;
-
-    LOGFUNC("%s:size : %d ", __FUNCTION__, size * channel_count * sizeof(short));
-    return size * channel_count * sizeof(short);
-}
-
-
-static uint32_t out_get_sample_rate(const struct audio_stream *stream)
-{
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
-    return DEFAULT_OUT_SAMPLING_RATE;
-}
-
-static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
-{
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, stream, rate);
-
-    return 0;
-}
-
-static size_t out_get_buffer_size(const struct audio_stream *stream)
-{
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
-    /* take resampling into account and return the closest majoring
-    multiple of 16 frames, as audioflinger expects audio buffers to
-    be a multiple of 16 frames */
-    size_t size = (SHORT_PERIOD_SIZE * DEFAULT_OUT_SAMPLING_RATE) / out->config.rate;
-    size = ((size + 15) / 16) * 16;
-    return size * audio_stream_frame_size((struct audio_stream *)stream);
-}
-
-static uint32_t out_get_channels(const struct audio_stream *stream)
-{
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
-    return AUDIO_CHANNEL_OUT_STEREO;
-}
-
-static int out_get_format(const struct audio_stream *stream)
-{
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
-    return AUDIO_FORMAT_PCM_16_BIT;
-}
-
-static int out_set_format(struct audio_stream *stream, int format)
-{
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
-    return 0;
-}
-
-/* must be called with hw device and output stream mutexes locked */
-static int do_output_standby(struct omap3_stream_out *out)
-{
-    struct omap3_audio_device *adev = out->dev;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, out);
+    struct audio_device *adev = out->dev;
 
     if (!out->standby) {
         pcm_close(out->pcm);
         out->pcm = NULL;
-        adev->active_output = 0;
+        adev->active_out = NULL;
+        if (out->resampler) {
+            release_resampler(out->resampler);
+            out->resampler = NULL;
+        }
+        if (out->buffer) {
+            free(out->buffer);
+            out->buffer = NULL;
+        }
+        out->standby = true;
     }
-        out->standby = 1;
+}
+
+/* must be called with hw device and input stream mutexes locked */
+static void do_in_standby(struct stream_in *in)
+{
+    struct audio_device *adev = in->dev;
+
+    if (!in->standby) {
+        pcm_close(in->pcm);
+        in->pcm = NULL;
+        adev->active_in = NULL;
+        if (in->resampler) {
+            release_resampler(in->resampler);
+            in->resampler = NULL;
+        }
+        if (in->buffer) {
+            free(in->buffer);
+            in->buffer = NULL;
+        }
+        in->standby = true;
+    }
+}
+
+/* must be called with hw device and output stream mutexes locked */
+static int start_output_stream(struct stream_out *out)
+{
+    struct audio_device *adev = out->dev;
+    unsigned int device;
+    int ret;
+
+    /*
+     * Due to the lack of sample rate converters in the SoC,
+     * it greatly simplifies things to have only the main
+     * (speaker/headphone) PCM or the BC SCO PCM open at
+     * the same time.
+     */
+    if (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO) {
+        device = PCM_DEVICE_SCO;
+        out->pcm_config = &pcm_config_sco;
+    } else {
+        device = PCM_DEVICE;
+        out->pcm_config = &pcm_config_out;
+        out->buffer_type = OUT_BUFFER_TYPE_UNKNOWN;
+    }
+
+    /*
+     * All open PCMs can only use a single group of rates at once:
+     * Group 1: 11.025, 22.05, 44.1
+     * Group 2: 8, 16, 32, 48
+     * Group 1 is used for digital audio playback since 44.1 is
+     * the most common rate, but group 2 is required for SCO.
+     */
+    if (adev->active_in) {
+        pthread_mutex_lock(&adev->active_in->lock);
+        if (((out->pcm_config->rate % 8000 == 0) &&
+                 (adev->active_in->pcm_config->rate % 8000) != 0) ||
+                 ((out->pcm_config->rate % 11025 == 0) &&
+                 (adev->active_in->pcm_config->rate % 11025) != 0))
+            do_in_standby(adev->active_in);
+        pthread_mutex_unlock(&adev->active_in->lock);
+    }
+
+    out->pcm = pcm_open(PCM_CARD, device, PCM_OUT | PCM_NORESTART, out->pcm_config);
+
+    if (out->pcm && !pcm_is_ready(out->pcm)) {
+        ALOGE("pcm_open(out) failed: %s", pcm_get_error(out->pcm));
+        pcm_close(out->pcm);
+        return -ENOMEM;
+    }
+
+    /*
+     * If the stream rate differs from the PCM rate, we need to
+     * create a resampler.
+     */
+    if (out_get_sample_rate(&out->stream.common) != out->pcm_config->rate) {
+        ret = create_resampler(out_get_sample_rate(&out->stream.common),
+                               out->pcm_config->rate,
+                               out->pcm_config->channels,
+                               RESAMPLER_QUALITY_DEFAULT,
+                               NULL,
+                               &out->resampler);
+        out->buffer_frames = (pcm_config_out.period_size * out->pcm_config->rate) /
+                out_get_sample_rate(&out->stream.common) + 1;
+
+        out->buffer = malloc(pcm_frames_to_bytes(out->pcm, out->buffer_frames));
+    }
+
+    adev->active_out = out;
+
     return 0;
+}
+
+/* must be called with hw device and input stream mutexes locked */
+static int start_input_stream(struct stream_in *in)
+{
+    struct audio_device *adev = in->dev;
+    unsigned int device;
+    int ret;
+
+    /*
+     * Due to the lack of sample rate converters in the SoC,
+     * it greatly simplifies things to have only the main
+     * mic PCM or the BC SCO PCM open at the same time.
+     */
+    if (adev->devices & AUDIO_DEVICE_IN_ALL_SCO) {
+        device = PCM_DEVICE_SCO;
+        in->pcm_config = &pcm_config_sco;
+    } else {
+        device = PCM_DEVICE;
+        in->pcm_config = &pcm_config_in;
+    }
+
+    /*
+     * All open PCMs can only use a single group of rates at once:
+     * Group 1: 11.025, 22.05, 44.1
+     * Group 2: 8, 16, 32, 48
+     * Group 1 is used for digital audio playback since 44.1 is
+     * the most common rate, but group 2 is required for SCO.
+     */
+    if (adev->active_out) {
+        pthread_mutex_lock(&adev->active_out->lock);
+        if (((in->pcm_config->rate % 8000 == 0) &&
+                 (adev->active_out->pcm_config->rate % 8000) != 0) ||
+                 ((in->pcm_config->rate % 11025 == 0) &&
+                 (adev->active_out->pcm_config->rate % 11025) != 0))
+            do_out_standby(adev->active_out);
+        pthread_mutex_unlock(&adev->active_out->lock);
+    }
+
+    in->pcm = pcm_open(PCM_CARD, device, PCM_IN, in->pcm_config);
+
+    if (in->pcm && !pcm_is_ready(in->pcm)) {
+        ALOGE("pcm_open(in) failed: %s", pcm_get_error(in->pcm));
+        pcm_close(in->pcm);
+        return -ENOMEM;
+    }
+
+    /*
+     * If the stream rate differs from the PCM rate, we need to
+     * create a resampler.
+     */
+    if (in_get_sample_rate(&in->stream.common) != in->pcm_config->rate) {
+        in->buf_provider.get_next_buffer = get_next_buffer;
+        in->buf_provider.release_buffer = release_buffer;
+
+        ret = create_resampler(in->pcm_config->rate,
+                               in_get_sample_rate(&in->stream.common),
+                               1,
+                               RESAMPLER_QUALITY_DEFAULT,
+                               &in->buf_provider,
+                               &in->resampler);
+    }
+    in->buffer_size = pcm_frames_to_bytes(in->pcm,
+                                          in->pcm_config->period_size);
+    in->buffer = malloc(in->buffer_size);
+
+    adev->active_in = in;
+
+    return 0;
+}
+
+static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
+                                   struct resampler_buffer* buffer)
+{
+    struct stream_in *in;
+
+    if (buffer_provider == NULL || buffer == NULL)
+        return -EINVAL;
+
+    in = (struct stream_in *)((char *)buffer_provider -
+                                   offsetof(struct stream_in, buf_provider));
+
+    if (in->pcm == NULL) {
+        buffer->raw = NULL;
+        buffer->frame_count = 0;
+        in->read_status = -ENODEV;
+        return -ENODEV;
+    }
+
+    if (in->frames_in == 0) {
+        in->read_status = pcm_read(in->pcm,
+                                   (void*)in->buffer,
+                                   in->buffer_size);
+        if (in->read_status != 0) {
+            ALOGE("get_next_buffer() pcm_read error %d", in->read_status);
+            buffer->raw = NULL;
+            buffer->frame_count = 0;
+            return in->read_status;
+        }
+        in->frames_in = in->pcm_config->period_size;
+        if (in->pcm_config->channels == 2) {
+            unsigned int i;
+
+            /* Discard right channel */
+            for (i = 1; i < in->frames_in; i++)
+                in->buffer[i] = in->buffer[i * 2];
+        }
+    }
+
+    buffer->frame_count = (buffer->frame_count > in->frames_in) ?
+                                in->frames_in : buffer->frame_count;
+    buffer->i16 = in->buffer + (in->pcm_config->period_size - in->frames_in);
+
+    return in->read_status;
+
+}
+
+static void release_buffer(struct resampler_buffer_provider *buffer_provider,
+                                  struct resampler_buffer* buffer)
+{
+    struct stream_in *in;
+
+    if (buffer_provider == NULL || buffer == NULL)
+        return;
+
+    in = (struct stream_in *)((char *)buffer_provider -
+                                   offsetof(struct stream_in, buf_provider));
+
+    in->frames_in -= buffer->frame_count;
+}
+
+/* read_frames() reads frames from kernel driver, down samples to capture rate
+ * if necessary and output the number of frames requested to the buffer specified */
+static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames)
+{
+    ssize_t frames_wr = 0;
+
+    while (frames_wr < frames) {
+        size_t frames_rd = frames - frames_wr;
+        if (in->resampler != NULL) {
+            in->resampler->resample_from_provider(in->resampler,
+                    (int16_t *)((char *)buffer +
+                            frames_wr * audio_stream_frame_size(&in->stream.common)),
+                    &frames_rd);
+        } else {
+            struct resampler_buffer buf = {
+                    { raw : NULL, },
+                    frame_count : frames_rd,
+            };
+            get_next_buffer(&in->buf_provider, &buf);
+            if (buf.raw != NULL) {
+                memcpy((char *)buffer +
+                           frames_wr * audio_stream_frame_size(&in->stream.common),
+                        buf.raw,
+                        buf.frame_count * audio_stream_frame_size(&in->stream.common));
+                frames_rd = buf.frame_count;
+            }
+            release_buffer(&in->buf_provider, &buf);
+        }
+        /* in->read_status is updated by getNextBuffer() also called by
+         * in->resampler->resample_from_provider() */
+        if (in->read_status != 0)
+            return in->read_status;
+
+        frames_wr += frames_rd;
+    }
+    return frames_wr;
+}
+
+/* API functions */
+
+static uint32_t out_get_sample_rate(const struct audio_stream *stream)
+{
+    return pcm_config_out.rate;
+}
+
+static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+{
+    return -ENOSYS;
+}
+
+static size_t out_get_buffer_size(const struct audio_stream *stream)
+{
+    return pcm_config_out.period_size *
+               audio_stream_frame_size((struct audio_stream *)stream);
+}
+
+static uint32_t out_get_channels(const struct audio_stream *stream)
+{
+    return AUDIO_CHANNEL_OUT_STEREO;
+}
+
+static audio_format_t out_get_format(const struct audio_stream *stream)
+{
+    return AUDIO_FORMAT_PCM_16_BIT;
+}
+
+static int out_set_format(struct audio_stream *stream, audio_format_t format)
+{
+    return -ENOSYS;
 }
 
 static int out_standby(struct audio_stream *stream)
 {
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
-    int status;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
+    struct stream_out *out = (struct stream_out *)stream;
 
     pthread_mutex_lock(&out->dev->lock);
     pthread_mutex_lock(&out->lock);
-    status = do_output_standby(out);
+    do_out_standby(out);
     pthread_mutex_unlock(&out->lock);
     pthread_mutex_unlock(&out->dev->lock);
-    return status;
+
+    return 0;
 }
 
 static int out_dump(const struct audio_stream *stream, int fd)
 {
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, stream, fd);
-
     return 0;
 }
 
 static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+    struct str_parms *parms;
+    char value[32];
+    int ret;
+    unsigned int val;
 
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, stream, kvpairs);
+    parms = str_parms_create_str(kvpairs);
 
-    return 0;
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
+                            value, sizeof(value));
+    pthread_mutex_lock(&adev->lock);
+    if (ret >= 0) {
+        val = atoi(value);
+        if (((adev->devices & AUDIO_DEVICE_OUT_ALL) != val) && (val != 0)) {
+            /*
+             * If SCO is turned on/off, we need to put audio into standby
+             * because SCO uses a different PCM.
+             */
+            if ((val & AUDIO_DEVICE_OUT_ALL_SCO) ^
+                    (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO)) {
+                pthread_mutex_lock(&out->lock);
+                do_out_standby(out);
+                pthread_mutex_unlock(&out->lock);
+            }
+
+            adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
+            adev->devices |= val;
+            select_devices(adev);
+        }
+    }
+    pthread_mutex_unlock(&adev->lock);
+
+    str_parms_destroy(parms);
+    return ret;
 }
 
 static char * out_get_parameters(const struct audio_stream *stream, const char *keys)
 {
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, stream, keys);
-
     return strdup("");
 }
 
 static uint32_t out_get_latency(const struct audio_stream_out *stream)
 {
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
+    size_t period_count;
 
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-    return (SHORT_PERIOD_SIZE * PLAYBACK_PERIOD_COUNT * 1000) / out->config.rate;
+    pthread_mutex_lock(&adev->lock);
+
+    if (adev->screen_off && !adev->active_in && !(adev->devices & AUDIO_DEVICE_OUT_ALL_SCO))
+        period_count = OUT_LONG_PERIOD_COUNT;
+    else
+        period_count = OUT_SHORT_PERIOD_COUNT;
+
+    pthread_mutex_unlock(&adev->lock);
+
+    return (pcm_config_out.period_size * period_count * 1000) / pcm_config_out.rate;
 }
 
 static int out_set_volume(struct audio_stream_out *stream, float left,
                           float right)
 {
-    LOGFUNC("%s(%p, %f, %f)", __FUNCTION__, stream, left, right);
-
     return -ENOSYS;
 }
 
 static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
                          size_t bytes)
 {
-    int ret;
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
-    struct omap3_audio_device *adev = out->dev;
+    int ret = 0;
+    struct stream_out *out = (struct stream_out *)stream;
+    struct audio_device *adev = out->dev;
     size_t frame_size = audio_stream_frame_size(&out->stream.common);
+    int16_t *in_buffer = (int16_t *)buffer;
     size_t in_frames = bytes / frame_size;
-    size_t out_frames = RESAMPLER_BUFFER_SIZE / frame_size;
-    struct omap3_stream_in *in;
+    size_t out_frames;
+    int buffer_type;
     int kernel_frames;
-    void *buf;
+    bool sco_on;
 
-    LOGFUNC("%s(%p, %p, %d)", __FUNCTION__, stream, buffer, bytes);
-
-do_over:
-
-    /* acquiring hw device mutex systematically is useful if a low priority thread is waiting
-     * on the output stream mutex - e.g. executing select_mode() while holding the hw device
+    /*
+     * acquiring hw device mutex systematically is useful if a low
+     * priority thread is waiting on the output stream mutex - e.g.
+     * executing out_set_parameters() while holding the hw device
      * mutex
      */
     pthread_mutex_lock(&adev->lock);
@@ -648,54 +632,125 @@ do_over:
             pthread_mutex_unlock(&adev->lock);
             goto exit;
         }
-        out->standby = 0;
+        out->standby = false;
     }
+    buffer_type = (adev->screen_off && !adev->active_in) ?
+            OUT_BUFFER_TYPE_LONG : OUT_BUFFER_TYPE_SHORT;
+    sco_on = (adev->devices & AUDIO_DEVICE_OUT_ALL_SCO);
     pthread_mutex_unlock(&adev->lock);
 
-    if (out->config.rate != DEFAULT_OUT_SAMPLING_RATE) {
-	LOGFUNC(" %d Sampleing rate not supported\n", out->config.rate)	;
+    /* detect changes in screen ON/OFF state and adapt buffer size
+     * if needed. Do not change buffer size when routed to SCO device. */
+    if (!sco_on && (buffer_type != out->buffer_type)) {
+        size_t period_count;
+
+        if (buffer_type == OUT_BUFFER_TYPE_LONG)
+            period_count = OUT_LONG_PERIOD_COUNT;
+        else
+            period_count = OUT_SHORT_PERIOD_COUNT;
+
+        out->write_threshold = out->pcm_config->period_size * period_count;
+        /* reset current threshold if exiting standby */
+        if (out->buffer_type == OUT_BUFFER_TYPE_UNKNOWN)
+            out->cur_write_threshold = out->write_threshold;
+        out->buffer_type = buffer_type;
     }
 
-    out_frames = in_frames;
-    buf = (void *)buffer;
+    /* Reduce number of channels, if necessary */
+    if (popcount(out_get_channels(&stream->common)) >
+                 (int)out->pcm_config->channels) {
+        unsigned int i;
 
+        /* Discard right channel */
+        for (i = 1; i < in_frames; i++)
+            in_buffer[i] = in_buffer[i * 2];
 
-    /* do not allow more than out->write_threshold frames in kernel pcm driver buffer */
-    do {
-        struct timespec time_stamp;
+        /* The frame size is now half */
+        frame_size /= 2;
+    }
 
-        if (pcm_get_htimestamp(out->pcm, (unsigned int *)&kernel_frames, &time_stamp) < 0)
-            break;
-        kernel_frames = pcm_get_buffer_size(out->pcm) - kernel_frames;
-        if (kernel_frames > out->write_threshold) {
-            unsigned long time = (unsigned long)
-                    (((int64_t)(kernel_frames - out->write_threshold) * 1000000) /
-                            MM_FULL_POWER_SAMPLING_RATE);
-            if (time < MIN_WRITE_SLEEP_US)
-                time = MIN_WRITE_SLEEP_US;
-            usleep(time);
+    /* Change sample rate, if necessary */
+    if (out_get_sample_rate(&stream->common) != out->pcm_config->rate) {
+        out_frames = out->buffer_frames;
+        out->resampler->resample_from_input(out->resampler,
+                                            in_buffer, &in_frames,
+                                            out->buffer, &out_frames);
+        in_buffer = out->buffer;
+    } else {
+        out_frames = in_frames;
+    }
+
+    if (!sco_on) {
+        int total_sleep_time_us = 0;
+        size_t period_size = out->pcm_config->period_size;
+
+        /* do not allow more than out->cur_write_threshold frames in kernel
+         * pcm driver buffer */
+        do {
+            struct timespec time_stamp;
+            if (pcm_get_htimestamp(out->pcm,
+                                   (unsigned int *)&kernel_frames,
+                                   &time_stamp) < 0)
+                break;
+            kernel_frames = pcm_get_buffer_size(out->pcm) - kernel_frames;
+
+            if (kernel_frames > out->cur_write_threshold) {
+                int sleep_time_us =
+                    (int)(((int64_t)(kernel_frames - out->cur_write_threshold)
+                                    * 1000000) / out->pcm_config->rate);
+                if (sleep_time_us < MIN_WRITE_SLEEP_US)
+                    break;
+                total_sleep_time_us += sleep_time_us;
+                if (total_sleep_time_us > MAX_WRITE_SLEEP_US) {
+                    ALOGW("out_write() limiting sleep time %d to %d",
+                          total_sleep_time_us, MAX_WRITE_SLEEP_US);
+                    sleep_time_us = MAX_WRITE_SLEEP_US -
+                                        (total_sleep_time_us - sleep_time_us);
+                }
+                usleep(sleep_time_us);
+            }
+
+        } while ((kernel_frames > out->cur_write_threshold) &&
+                (total_sleep_time_us <= MAX_WRITE_SLEEP_US));
+
+        /* do not allow abrupt changes on buffer size. Increasing/decreasing
+         * the threshold by steps of 1/4th of the buffer size keeps the write
+         * time within a reasonable range during transitions.
+         * Also reset current threshold just above current filling status when
+         * kernel buffer is really depleted to allow for smooth catching up with
+         * target threshold.
+         */
+        if (out->cur_write_threshold > out->write_threshold) {
+            out->cur_write_threshold -= period_size / 4;
+            if (out->cur_write_threshold < out->write_threshold) {
+                out->cur_write_threshold = out->write_threshold;
+            }
+        } else if (out->cur_write_threshold < out->write_threshold) {
+            out->cur_write_threshold += period_size / 4;
+            if (out->cur_write_threshold > out->write_threshold) {
+                out->cur_write_threshold = out->write_threshold;
+            }
+        } else if ((kernel_frames < out->write_threshold) &&
+            ((out->write_threshold - kernel_frames) >
+                (int)(period_size * OUT_SHORT_PERIOD_COUNT))) {
+            out->cur_write_threshold = (kernel_frames / period_size + 1) * period_size;
+            out->cur_write_threshold += period_size / 4;
         }
-    } while (kernel_frames > out->write_threshold);
+    }
 
-    ret = pcm_mmap_write(out->pcm, (void *)buf, out_frames * frame_size);
+    ret = pcm_write(out->pcm, in_buffer, out_frames * frame_size);
+    if (ret == -EPIPE) {
+        /* In case of underrun, don't sleep since we want to catch up asap */
+        pthread_mutex_unlock(&out->lock);
+        return ret;
+    }
 
 exit:
     pthread_mutex_unlock(&out->lock);
 
-    if (ret > 0) {
+    if (ret != 0) {
         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
                out_get_sample_rate(&stream->common));
-    }
-
-    if (ret == -EPIPE) {
-	    /* Recover from an underrun */
-	    LOGE("XRUN detected");
-	    pthread_mutex_lock(&adev->lock);
-	    pthread_mutex_lock(&out->lock);
-	    do_output_standby(out);
-	    pthread_mutex_unlock(&out->lock);
-	    pthread_mutex_unlock(&adev->lock);
-	    goto do_over;
     }
 
     return bytes;
@@ -704,171 +759,135 @@ exit:
 static int out_get_render_position(const struct audio_stream_out *stream,
                                    uint32_t *dsp_frames)
 {
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, stream, dsp_frames);
-
     return -EINVAL;
 }
 
 static int out_add_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
 {
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, stream, effect);
-
     return 0;
 }
 
 static int out_remove_audio_effect(const struct audio_stream *stream, effect_handle_t effect)
 {
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, stream, effect);
-
     return 0;
+}
+
+static int out_get_next_write_timestamp(const struct audio_stream_out *stream,
+                                        int64_t *timestamp)
+{
+    return -EINVAL;
 }
 
 /** audio_stream_in implementation **/
-
-/* must be called with hw device and input stream mutexes locked */
-static int start_input_stream(struct omap3_stream_in *in)
-{
-    int ret = 0;
-    unsigned int card = CARD_OMAP3_DEFAULT;
-    unsigned int device = PORT_OMAP3;
-    struct omap3_audio_device *adev = in->dev;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, in);
-
-    adev->active_input = in;
-
-    LOGFUNC("%s: opening pcm device\n", __FUNCTION__);
-
-    in->pcm = pcm_open(card, device, PCM_IN, &in->config);
-
-
-    if (!pcm_is_ready(in->pcm)) {
-        LOGE("cannot open pcm_in driver: %s", pcm_get_error(in->pcm));
-        pcm_close(in->pcm);
-        adev->active_input = NULL;
-        return -ENOMEM;
-    }
-
-    LOGFUNC("%s: opened pcm device:  %s\n", __FUNCTION__, pcm_get_error (in->pcm));
-    return 0;
-}
-
 static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-    LOGFUNC("%s(%d)", __FUNCTION__, in->requested_rate);
+    struct stream_in *in = (struct stream_in *)stream;
 
     return in->requested_rate;
 }
 
 static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 {
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, stream, rate);
-
     return 0;
 }
 
 static size_t in_get_buffer_size(const struct audio_stream *stream)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
+    struct stream_in *in = (struct stream_in *)stream;
+    size_t size;
 
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
+    /*
+     * take resampling into account and return the closest majoring
+     * multiple of 16 frames, as audioflinger expects audio buffers to
+     * be a multiple of 16 frames
+     */
+    size = (in->pcm_config->period_size * in_get_sample_rate(stream)) /
+            in->pcm_config->rate;
+    size = ((size + 15) / 16) * 16;
 
-    return get_input_buffer_size(in->requested_rate,
-                                 AUDIO_FORMAT_PCM_16_BIT,
-                                 in->config.channels);
+    return size * audio_stream_frame_size((struct audio_stream *)stream);
 }
 
 static uint32_t in_get_channels(const struct audio_stream *stream)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-    LOGFUNC("%s(%d)", __FUNCTION__, in->config.channels);
-
-    if (in->config.channels == 1) {
-        return AUDIO_CHANNEL_IN_MONO;
-    } else {
-        return AUDIO_CHANNEL_IN_STEREO;
-    }
+    return AUDIO_CHANNEL_IN_MONO;
 }
 
-static int in_get_format(const struct audio_stream *stream)
+static audio_format_t in_get_format(const struct audio_stream *stream)
 {
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
     return AUDIO_FORMAT_PCM_16_BIT;
 }
 
-static int in_set_format(struct audio_stream *stream, int format)
+static int in_set_format(struct audio_stream *stream, audio_format_t format)
 {
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, stream, format);
-
-    return 0;
-}
-
-/* must be called with hw device and input stream mutexes locked */
-static int do_input_standby(struct omap3_stream_in *in)
-{
-    struct omap3_audio_device *adev = in->dev;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, in);
-
-    if (!in->standby ) {
-        pcm_close(in->pcm);
-        in->pcm = NULL;
-        adev->active_input = 0;
-	LOGFUNC("%s: close pcm device", __FUNCTION__);
-        in->standby = 1;
-    }
-    return 0;
+    return -ENOSYS;
 }
 
 static int in_standby(struct audio_stream *stream)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-    int status = 0;
-
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
+    struct stream_in *in = (struct stream_in *)stream;
 
     pthread_mutex_lock(&in->dev->lock);
     pthread_mutex_lock(&in->lock);
-    status = do_input_standby(in);
+    do_in_standby(in);
     pthread_mutex_unlock(&in->lock);
     pthread_mutex_unlock(&in->dev->lock);
-    return status;
+
+    return 0;
 }
 
 static int in_dump(const struct audio_stream *stream, int fd)
 {
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, stream, fd);
-
     return 0;
 }
 
 static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
+    struct str_parms *parms;
+    char value[32];
+    int ret;
+    unsigned int val;
 
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, stream, kvpairs);
+    parms = str_parms_create_str(kvpairs);
 
-    return 0;
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
+                            value, sizeof(value));
+    pthread_mutex_lock(&adev->lock);
+    if (ret >= 0) {
+        val = atoi(value);
+        if (((adev->devices & AUDIO_DEVICE_IN_ALL) != val) && (val != 0)) {
+            /*
+             * If SCO is turned on/off, we need to put audio into standby
+             * because SCO uses a different PCM.
+             */
+            if ((val & AUDIO_DEVICE_IN_ALL_SCO) ^
+                    (adev->devices & AUDIO_DEVICE_IN_ALL_SCO)) {
+                pthread_mutex_lock(&in->lock);
+                do_in_standby(in);
+                pthread_mutex_unlock(&in->lock);
+            }
+
+            adev->devices &= ~AUDIO_DEVICE_IN_ALL;
+            adev->devices |= val;
+            select_devices(adev);
+        }
+    }
+    pthread_mutex_unlock(&adev->lock);
+
+    str_parms_destroy(parms);
+    return ret;
 }
 
 static char * in_get_parameters(const struct audio_stream *stream,
                                 const char *keys)
 {
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, stream, keys);
-
     return strdup("");
 }
 
 static int in_set_gain(struct audio_stream_in *stream, float gain)
 {
-    LOGFUNC("%s(%p, %f)", __FUNCTION__, stream, gain);
-
     return 0;
 }
 
@@ -876,15 +895,14 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
                        size_t bytes)
 {
     int ret = 0;
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-    struct omap3_audio_device *adev = in->dev;
+    struct stream_in *in = (struct stream_in *)stream;
+    struct audio_device *adev = in->dev;
     size_t frames_rq = bytes / audio_stream_frame_size(&stream->common);
 
-    LOGFUNC("%s(%p, %p, %d)", __FUNCTION__, stream, buffer, bytes);
-    LOGE("%s(%p, %p, %d)", __FUNCTION__, stream, buffer, bytes);
-
-    /* acquiring hw device mutex systematically is useful if a low priority thread is waiting
-     * on the input stream mutex - e.g. executing select_mode() while holding the hw device
+    /*
+     * acquiring hw device mutex systematically is useful if a low
+     * priority thread is waiting on the input stream mutex - e.g.
+     * executing in_set_parameters() while holding the hw device
      * mutex
      */
     pthread_mutex_lock(&adev->lock);
@@ -899,60 +917,76 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     if (ret < 0)
         goto exit;
 
-        ret = pcm_read(in->pcm, buffer, bytes);
+    /*if (in->num_preprocessors != 0) {
+        ret = process_frames(in, buffer, frames_rq);
+    } else */if (in->resampler != NULL) {
+        ret = read_frames(in, buffer, frames_rq);
+    } else if (in->pcm_config->channels == 2) {
+        /*
+         * If the PCM is stereo, capture twice as many frames and
+         * discard the right channel.
+         */
+        unsigned int i;
+        int16_t *in_buffer = (int16_t *)buffer;
 
+        ret = pcm_read(in->pcm, in->buffer, bytes * 2);
+
+        /* Discard right channel */
+        for (i = 0; i < frames_rq; i++)
+            in_buffer[i] = in->buffer[i * 2];
+    } else {
+        ret = pcm_read(in->pcm, buffer, bytes);
+    }
+
+    if (ret > 0)
+        ret = 0;
+
+    /*
+     * Instead of writing zeroes here, we could trust the hardware
+     * to always provide zeroes when muted.
+     */
     if (ret == 0 && adev->mic_mute)
         memset(buffer, 0, bytes);
 
 exit:
     if (ret < 0)
-    {
         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
                in_get_sample_rate(&stream->common));
 
-    memset(buffer, 0, bytes);
-    }
     pthread_mutex_unlock(&in->lock);
     return bytes;
 }
 
 static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
 {
-    LOGFUNC("%s(%p)", __FUNCTION__, stream);
-
     return 0;
 }
 
 static int in_add_audio_effect(const struct audio_stream *stream,
                                effect_handle_t effect)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, stream, effect);
     return 0;
 }
 
 static int in_remove_audio_effect(const struct audio_stream *stream,
                                   effect_handle_t effect)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
     return 0;
 }
 
 
 static int adev_open_output_stream(struct audio_hw_device *dev,
-                                   uint32_t devices, int *format,
-                                   uint32_t *channels, uint32_t *sample_rate,
+                                   audio_io_handle_t handle,
+                                   audio_devices_t devices,
+                                   audio_output_flags_t flags,
+                                   struct audio_config *config,
                                    struct audio_stream_out **stream_out)
 {
-    struct omap3_audio_device *ladev = (struct omap3_audio_device *)dev;
-    struct omap3_stream_out *out;
+    struct audio_device *adev = (struct audio_device *)dev;
+    struct stream_out *out;
     int ret;
 
-    LOGFUNC("%s(%p, 0x%04x,%d, 0x%04x, %d, %p)", __FUNCTION__, dev, devices,
-                        *format, *channels, *sample_rate, stream_out);
-
-    out = (struct omap3_stream_out *)calloc(1, sizeof(struct omap3_stream_out));
+    out = (struct stream_out *)calloc(1, sizeof(struct stream_out));
     if (!out)
         return -ENOMEM;
 
@@ -972,23 +1006,15 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     out->stream.set_volume = out_set_volume;
     out->stream.write = out_write;
     out->stream.get_render_position = out_get_render_position;
+    out->stream.get_next_write_timestamp = out_get_next_write_timestamp;
 
-    out->config = pcm_config_mm;
+    out->dev = adev;
 
-    out->dev = ladev;
-    out->standby = 1;
+    config->format = out_get_format(&out->stream.common);
+    config->channel_mask = out_get_channels(&out->stream.common);
+    config->sample_rate = out_get_sample_rate(&out->stream.common);
 
-    /* FIXME: when we support multiple output devices, we will want to
-     * do the following:
-     * adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
-     * adev->devices |= out->device;
-     * select_output_device(adev);
-     * This is because out_set_parameters() with a route is not
-     * guaranteed to be called after an output stream is opened. */
-
-    *format = out_get_format(&out->stream.common);
-    *channels = out_get_channels(&out->stream.common);
-    *sample_rate = out_get_sample_rate(&out->stream.common);
+    out->standby = true;
 
     *stream_out = &out->stream;
     return 0;
@@ -1002,69 +1028,88 @@ err_open:
 static void adev_close_output_stream(struct audio_hw_device *dev,
                                      struct audio_stream_out *stream)
 {
-    struct omap3_stream_out *out = (struct omap3_stream_out *)stream;
-
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, dev, stream);
-
     out_standby(&stream->common);
-    if (out->buffer)
-        free(out->buffer);
     free(stream);
 }
 
 static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)dev;
+    struct audio_device *adev = (struct audio_device *)dev;
+    struct str_parms *parms;
+    char *str;
+    char value[32];
+    int ret;
 
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, dev, kvpairs);
+    parms = str_parms_create_str(kvpairs);
+    ret = str_parms_get_str(parms, "orientation", value, sizeof(value));
+    if (ret >= 0) {
+        int orientation;
 
-    return 0;
+        if (strcmp(value, "landscape") == 0)
+            orientation = ORIENTATION_LANDSCAPE;
+        else if (strcmp(value, "portrait") == 0)
+            orientation = ORIENTATION_PORTRAIT;
+        else if (strcmp(value, "square") == 0)
+            orientation = ORIENTATION_SQUARE;
+        else
+            orientation = ORIENTATION_UNDEFINED;
+
+        pthread_mutex_lock(&adev->lock);
+        if (orientation != adev->orientation) {
+            adev->orientation = orientation;
+            /*
+             * Orientation changes can occur with the input device
+             * closed so we must call select_devices() here to set
+             * up the mixer. This is because select_devices() will
+             * not be called when the input device is opened if no
+             * other input parameter is changed.
+             */
+            select_devices(adev);
+        }
+        pthread_mutex_unlock(&adev->lock);
+    }
+
+    ret = str_parms_get_str(parms, "screen_state", value, sizeof(value));
+    if (ret >= 0) {
+        if (strcmp(value, AUDIO_PARAMETER_VALUE_ON) == 0)
+            adev->screen_off = false;
+        else
+            adev->screen_off = true;
+    }
+
+    str_parms_destroy(parms);
+    return ret;
 }
 
 static char * adev_get_parameters(const struct audio_hw_device *dev,
                                   const char *keys)
 {
-    LOGFUNC("%s(%p, %s)", __FUNCTION__, dev, keys);
-
     return strdup("");
 }
 
 static int adev_init_check(const struct audio_hw_device *dev)
 {
-    LOGFUNC("%s(%p)", __FUNCTION__, dev);
     return 0;
 }
 
 static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)dev;
-
-    LOGFUNC("%s(%p, %f)", __FUNCTION__, dev, volume);
-    adev->voice_volume = volume;
-    return 0;
+    return -ENOSYS;
 }
 
 static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
 {
-    LOGFUNC("%s(%p, %f)", __FUNCTION__, dev, volume);
-
     return -ENOSYS;
 }
 
-static int adev_set_mode(struct audio_hw_device *dev, int mode)
+static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)dev;
-
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, dev, mode);
-
     return 0;
 }
 
 static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)dev;
-
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, dev, state);
+    struct audio_device *adev = (struct audio_device *)dev;
 
     adev->mic_mute = state;
 
@@ -1073,9 +1118,7 @@ static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
 
 static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)dev;
-
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, dev, state);
+    struct audio_device *adev = (struct audio_device *)dev;
 
     *state = adev->mic_mute;
 
@@ -1083,45 +1126,41 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
 }
 
 static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
-                                         uint32_t sample_rate, int format,
-                                         int channel_count)
+                                         const struct audio_config *config)
 {
     size_t size;
 
-    LOGFUNC("%s(%p, %d, %d, %d)", __FUNCTION__, dev, sample_rate,
-                                format, channel_count);
+    /*
+     * take resampling into account and return the closest majoring
+     * multiple of 16 frames, as audioflinger expects audio buffers to
+     * be a multiple of 16 frames
+     */
+    size = (pcm_config_in.period_size * config->sample_rate) / pcm_config_in.rate;
+    size = ((size + 15) / 16) * 16;
 
-    if (check_input_parameters(sample_rate, format, channel_count) != 0) {
-        return 0;
-    }
-
-    return get_input_buffer_size(sample_rate, format, channel_count);
+    return (size * popcount(config->channel_mask) *
+                audio_bytes_per_sample(config->format));
 }
 
-static int adev_open_input_stream(struct audio_hw_device *dev, uint32_t devices,
-                                  int *format, uint32_t *channel_mask,
-                                  uint32_t *sample_rate,
-                                  audio_in_acoustics_t acoustics,
+static int adev_open_input_stream(struct audio_hw_device *dev,
+                                  audio_io_handle_t handle,
+                                  audio_devices_t devices,
+                                  struct audio_config *config,
                                   struct audio_stream_in **stream_in)
 {
-    struct omap3_audio_device *ladev = (struct omap3_audio_device *)dev;
-    struct omap3_stream_in *in;
+    struct audio_device *adev = (struct audio_device *)dev;
+    struct stream_in *in;
     int ret;
-//    int channel_count = popcount(*channel_mask);
-    int channel_count = 2;
-	*channel_mask = 0x3;
-    /*audioflinger expects return variable to be NULL incase of failure */
+
     *stream_in = NULL;
-    LOGFUNC("%s(%p, 0x%04x, %d, 0x%04x, %d, 0x%04x, %p)", __FUNCTION__, dev,
-        devices, *format, *channel_mask, *sample_rate, acoustics, stream_in);
 
-    if (check_input_parameters(*sample_rate, *format, channel_count) != 0)
-    {
-	    LOGFUNC("%s : checkparameter failed\n", __FUNCTION__);
-
-	return -EINVAL;
+    /* Respond with a request for mono if a different format is given. */
+    if (config->channel_mask != AUDIO_CHANNEL_IN_MONO) {
+        config->channel_mask = AUDIO_CHANNEL_IN_MONO;
+        return -EINVAL;
     }
-    in = (struct omap3_stream_in *)calloc(1, sizeof(struct omap3_stream_in));
+
+    in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
     if (!in)
         return -ENOMEM;
 
@@ -1141,87 +1180,50 @@ static int adev_open_input_stream(struct audio_hw_device *dev, uint32_t devices,
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
 
-    in->requested_rate = *sample_rate;
-    memcpy(&in->config, &pcm_config_mm_ul, sizeof(pcm_config_mm_ul));
-//    in->config.channels = channel_count;
-
-    in->buffer = malloc(2 * in->config.period_size * audio_stream_frame_size(&in->stream.common));
-    if (!in->buffer) {
-        ret = -ENOMEM;
-        goto err;
-    }
-
-    if (in->requested_rate != in->config.rate)
-    {
-	    LOGFUNC("%s: %d sampling rate not supported \n", __FUNCTION__, in->requested_rate);
-
-    }
-    in->dev = ladev;
-    in->standby = 1;
-    in->device = devices;
+    in->dev = adev;
+    in->standby = true;
+    in->requested_rate = config->sample_rate;
+    in->pcm_config = &pcm_config_in; /* default PCM config */
 
     *stream_in = &in->stream;
-    LOGFUNC("%s : open input stream successful : channels : %d\n", __FUNCTION__, popcount(*channel_mask));
     return 0;
-
-err:
-
-    free(in);
-    *stream_in = NULL;
-    return ret;
 }
 
 static void adev_close_input_stream(struct audio_hw_device *dev,
                                    struct audio_stream_in *stream)
 {
-    struct omap3_stream_in *in = (struct omap3_stream_in *)stream;
-
-    LOGFUNC("%s(%p, %p)", __FUNCTION__, dev, stream);
+    struct stream_in *in = (struct stream_in *)stream;
 
     in_standby(&stream->common);
     free(stream);
-    return;
 }
 
 static int adev_dump(const audio_hw_device_t *device, int fd)
 {
-    LOGFUNC("%s(%p, %d)", __FUNCTION__, device, fd);
-
     return 0;
 }
 
 static int adev_close(hw_device_t *device)
 {
-    struct omap3_audio_device *adev = (struct omap3_audio_device *)device;
+    struct audio_device *adev = (struct audio_device *)device;
 
-    LOGFUNC("%s(%p)", __FUNCTION__, device);
+    audio_route_free(adev->ar);
 
-
-    mixer_close(adev->mixer);
     free(device);
     return 0;
 }
 
 static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
 {
-    LOGFUNC("%s(%p)", __FUNCTION__, dev);
-
     return (/* OUT */
-            AUDIO_DEVICE_OUT_EARPIECE |
             AUDIO_DEVICE_OUT_SPEAKER |
             AUDIO_DEVICE_OUT_WIRED_HEADSET |
             AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
-            AUDIO_DEVICE_OUT_AUX_DIGITAL |
-            AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
-            AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
             AUDIO_DEVICE_OUT_ALL_SCO |
             AUDIO_DEVICE_OUT_DEFAULT |
             /* IN */
-            AUDIO_DEVICE_IN_COMMUNICATION |
-            AUDIO_DEVICE_IN_AMBIENT |
             AUDIO_DEVICE_IN_BUILTIN_MIC |
             AUDIO_DEVICE_IN_WIRED_HEADSET |
-            AUDIO_DEVICE_IN_AUX_DIGITAL |
             AUDIO_DEVICE_IN_BACK_MIC |
             AUDIO_DEVICE_IN_ALL_SCO |
             AUDIO_DEVICE_IN_DEFAULT);
@@ -1230,24 +1232,18 @@ static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
 static int adev_open(const hw_module_t* module, const char* name,
                      hw_device_t** device)
 {
-    struct omap3_audio_device *adev;
+    struct audio_device *adev;
     int ret;
-    pthread_mutexattr_t mta;
-
-    LOGFUNC("%s(%p, %s, %p)", __FUNCTION__, module, name, device);
 
     if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
-    {
-        LOGE("ERROR .....................");
         return -EINVAL;
-    }
 
-    adev = calloc(1, sizeof(struct omap3_audio_device));
+    adev = calloc(1, sizeof(struct audio_device));
     if (!adev)
         return -ENOMEM;
 
     adev->hw_device.common.tag = HARDWARE_DEVICE_TAG;
-    adev->hw_device.common.version = 0;
+    adev->hw_device.common.version = AUDIO_DEVICE_API_VERSION_1_0;
     adev->hw_device.common.module = (struct hw_module_t *) module;
     adev->hw_device.common.close = adev_close;
 
@@ -1267,39 +1263,9 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.close_input_stream = adev_close_input_stream;
     adev->hw_device.dump = adev_dump;
 
-    adev->mixer = mixer_open(0);
-    if (!adev->mixer) {
-        free(adev);
-        LOGE("Unable to open the mixer, aborting.");
-        return -EINVAL;
-    }
+    adev->ar = audio_route_init();
+    adev->orientation = ORIENTATION_UNDEFINED;
 
-    adev->mixer_ctls.headset_volume = mixer_get_ctl_by_name(adev->mixer,
-                                           MIXER_HEADSET_PLAYBACK_VOLUME);
-
-    pthread_mutexattr_init(&mta);
-    pthread_mutexattr_settype(&mta, PTHREAD_MUTEX_NORMAL);
-    pthread_mutex_init(&adev->lock, &mta);
-    pthread_mutexattr_destroy(&mta);
-
-    /* Set the default route before the PCM stream is opened */
-    pthread_mutex_lock(&adev->lock);
-
-    set_route_by_array(adev->mixer, defaults, 1);
-    adev->mode = AUDIO_MODE_NORMAL;
-    adev->devices = AUDIO_DEVICE_OUT_SPEAKER | AUDIO_DEVICE_IN_BUILTIN_MIC;
-    select_output_device(adev);
-
-    adev->voice_volume = 1.0f;
-    if(get_boardtype(adev)) {
-        pthread_mutex_unlock(&adev->lock);
-        mixer_close(adev->mixer);
-        free(adev);
-        LOGE("Unsupported boardtype, aborting.");
-        return -EINVAL;
-    }
-
-    pthread_mutex_unlock(&adev->lock);
     *device = &adev->hw_device.common;
 
     return 0;
@@ -1312,11 +1278,11 @@ static struct hw_module_methods_t hal_module_methods = {
 struct audio_module HAL_MODULE_INFO_SYM = {
     .common = {
         .tag = HARDWARE_MODULE_TAG,
-        .version_major = 1,
-        .version_minor = 0,
+        .module_api_version = AUDIO_MODULE_API_VERSION_0_1,
+        .hal_api_version = HARDWARE_HAL_API_VERSION,
         .id = AUDIO_HARDWARE_MODULE_ID,
-        .name = "Omap3 audio HW HAL",
-        .author = "Texas Instruments",
+        .name = "Rowboat audio HW HAL",
+        .author = "The Android Open Source Project",
         .methods = &hal_module_methods,
     },
 };
