@@ -84,10 +84,10 @@ CameraHardware::CameraHardware()
 	#else
 	version = get_kernel_version();
 	if(version <= 0)
-		LOGE("Failed to parse kernel version\n");
+		ALOGE("Failed to parse kernel version\n");
 	if(version >= KERNEL_VERSION(2,6,37))
 	{
-		LOGE("version >= KERNEL_VERSION(2,6,37)");
+		ALOGE("version >= KERNEL_VERSION(2,6,37)");
 		mCamera->Open(VIDEO_DEVICE_2);
 		mCamera->Open_media_device(MEDIA_DEVICE);
 	}
@@ -104,7 +104,7 @@ CameraHardware::CameraHardware()
     char value[PROPERTY_VALUE_MAX];
     property_get("debug.camera.showfps", value, "0");
     mDebugFps = atoi(value);
-    LOGD_IF(mDebugFps, "showfps enabled");
+    ALOGD_IF(mDebugFps, "showfps enabled");
 }
 
 void CameraHardware::initDefaultParameters()
@@ -128,7 +128,7 @@ void CameraHardware::initDefaultParameters()
     p.set(CameraParameters::KEY_FOCUS_MODE,0);
 
     if (setParameters(p) != NO_ERROR) {
-        LOGE("Failed to set default parameters?!");
+        ALOGE("Failed to set default parameters?!");
     }
     return;
 }
@@ -140,32 +140,32 @@ int CameraHardware::get_kernel_version()
 	int major,minor,rev,ver=-1;
 	if ((verstring = (char *) malloc(MAX_STR_LEN)) == NULL )
 	{
-		LOGE("Failed to allocate memory\n");
+		ALOGE("Failed to allocate memory\n");
 		return -1;
 	}
 	if ((dummy = (char *) malloc(MAX_STR_LEN)) == NULL )
 	{
-		LOGE("Failed to allocate memory\n");
+		ALOGE("Failed to allocate memory\n");
 		free (verstring);
 		return -1;
 	}
 
 	if ((fd = open("/proc/version", O_RDONLY)) < 0)
 	{
-		LOGE("Failed to open file /proc/version\n");
+		ALOGE("Failed to open file /proc/version\n");
 		goto ret;
 	}
 
 	if (read(fd, verstring, MAX_STR_LEN) < 0)
 	{
-		LOGE("Failed to read kernel version string from /proc/version file\n");
+		ALOGE("Failed to read kernel version string from /proc/version file\n");
 		close(fd);
 		goto ret;
 	}
 	close(fd);
 	if (sscanf(verstring, "%s %s %d.%d.%d%s\n", dummy, dummy, &major, &minor, &rev, dummy) != 6)
 	{
-		LOGE("Failed to read kernel version numbers\n");
+		ALOGE("Failed to read kernel version numbers\n");
 		goto ret;
 	}
 	ver = KERNEL_VERSION(major, minor, rev);
@@ -186,13 +186,13 @@ CameraHardware::~CameraHardware()
 
 sp<IMemoryHeap> CameraHardware::getPreviewHeap() const
 {
-    LOGV("Preview Heap");
+    ALOGV("Preview Heap");
     return mPreviewHeap;
 }
 
 sp<IMemoryHeap> CameraHardware::getRawHeap() const
 {
-    LOGV("Raw Heap");
+    ALOGV("Raw Heap");
     return mRawHeap;
 }
 
@@ -219,7 +219,7 @@ int CameraHardware::setPreviewWindow( preview_stream_ops_t *window)
             mNativeWindow=NULL;
     if(window==NULL)
     {
-        LOGW("Window is Null");
+        ALOGW("Window is Null");
         return 0;
     }
     int width, height;
@@ -233,10 +233,10 @@ int CameraHardware::setPreviewWindow( preview_stream_ops_t *window)
                 HAL_PIXEL_FORMAT_RGB_565);
     err = mNativeWindow->set_buffer_count(mNativeWindow, 3);
     if (err != 0) {
-        LOGE("native_window_set_buffer_count failed: %s (%d)", strerror(-err), -err);
+        ALOGE("native_window_set_buffer_count failed: %s (%d)", strerror(-err), -err);
 
         if ( ENODEV == err ) {
-            LOGE("Preview surface abandoned!");
+            ALOGE("Preview surface abandoned!");
             mNativeWindow = NULL;
         }
     }
@@ -246,21 +246,21 @@ int CameraHardware::setPreviewWindow( preview_stream_ops_t *window)
 
 void CameraHardware::enableMsgType(int32_t msgType)
 {
-	LOGD("enableMsgType:%d",msgType);
+	ALOGD("enableMsgType:%d",msgType);
     Mutex::Autolock lock(mLock);
     mMsgEnabled |= msgType;
 }
 
 void CameraHardware::disableMsgType(int32_t msgType)
 {
-	LOGD("disableMsgType:%d",msgType);
+	ALOGD("disableMsgType:%d",msgType);
     Mutex::Autolock lock(mLock);
     mMsgEnabled &= ~msgType;
 }
 
 bool CameraHardware::msgTypeEnabled(int32_t msgType)
 {
-	LOGD("msgTypeEnabled:%d",msgType);
+	ALOGD("msgTypeEnabled:%d",msgType);
     Mutex::Autolock lock(mLock);
     return (mMsgEnabled & msgType);
 }
@@ -272,13 +272,13 @@ bool CameraHardware::validateSize(size_t width, size_t height, const supported_r
     unsigned int size;
 
     if ( NULL == supRes ) {
-        LOGE("Invalid resolutions array passed");
+        ALOGE("Invalid resolutions array passed");
         stat = -EINVAL;
     }
 
     if ( NO_ERROR == stat ) {
         for ( unsigned int i = 0 ; i < count; i++ ) {
-           // LOGD( "Validating %d, %d and %d, %d", supRes[i].width, width, supRes[i].height, height);
+           // ALOGD( "Validating %d, %d and %d, %d", supRes[i].width, width, supRes[i].height, height);
             if ( ( supRes[i].width == width ) && ( supRes[i].height == height ) ) {
                 ret = true;
                 break;
@@ -302,7 +302,7 @@ static void showFPS(const char *tag)
         mFps =  ((mFrameCount - mLastFrameCount) * float(s2ns(1))) / diff;
         mLastFpsTime = now;
         mLastFrameCount = mFrameCount;
-        LOGD("[%s] %d Frames, %f FPS", tag, mFrameCount, mFps);
+        ALOGD("[%s] %d Frames, %f FPS", tag, mFrameCount, mFps);
     }
 }
 
@@ -325,7 +325,7 @@ int CameraHardware::previewThread()
         if (mNativeWindow != NULL) {
 
             if ((err = mNativeWindow->dequeue_buffer(mNativeWindow,(buffer_handle_t**) &hndl2hndl,&stride)) != 0) {
-                LOGW("Surface::dequeueBuffer returned error %d", err);
+                ALOGW("Surface::dequeueBuffer returned error %d", err);
                 return -1;
             }
 
@@ -395,31 +395,31 @@ status_t CameraHardware::startPreview()
     }
 
     mParameters.getPreviewSize(&mPreviewWidth, &mPreviewHeight);
-    LOGD("startPreview width:%d,height:%d",mPreviewWidth,mPreviewHeight);
+    ALOGD("startPreview width:%d,height:%d",mPreviewWidth,mPreviewHeight);
     if(mPreviewWidth <=0 || mPreviewHeight <=0) {
-        LOGE("Preview size is not valid,aborting..Device can not open!!!");
+        ALOGE("Preview size is not valid,aborting..Device can not open!!!");
         return INVALID_OPERATION;
     }
 
     ret = mCamera->Configure(mPreviewWidth,mPreviewHeight,PIXEL_FORMAT,30);
     if(ret < 0) {
-	    LOGE("Fail to configure camera device");
+	    ALOGE("Fail to configure camera device");
 	    return INVALID_OPERATION;
     }
 
    /* clear previously buffers*/
     if(mPreviewHeap != NULL) {
-        LOGD("mPreviewHeap Cleaning!!!!");
+        ALOGD("mPreviewHeap Cleaning!!!!");
         mPreviewHeap.clear();
     }
 
     if(mRawHeap != NULL) {
-        LOGD("mRawHeap Cleaning!!!!");
+        ALOGD("mRawHeap Cleaning!!!!");
         mRawHeap.clear();
     }
 
     if(mHeap != NULL) {
-        LOGD("mHeap Cleaning!!!!");
+        ALOGD("mHeap Cleaning!!!!");
         mHeap.clear();
     }
 
@@ -438,13 +438,13 @@ status_t CameraHardware::startPreview()
 
     ret = mCamera->BufferMap();
     if (ret) {
-        LOGE("Camera Init fail: %s", strerror(errno));
+        ALOGE("Camera Init fail: %s", strerror(errno));
         return UNKNOWN_ERROR;
     }
 
     ret = mCamera->StartStreaming();
     if (ret) {
-        LOGE("Camera StartStreaming fail: %s", strerror(errno));
+        ALOGE("Camera StartStreaming fail: %s", strerror(errno));
         mCamera->Uninit();
         mCamera->Close();
         return UNKNOWN_ERROR;
@@ -489,12 +489,12 @@ bool CameraHardware::previewEnabled()
 
 status_t CameraHardware::startRecording()
 {
-    LOGE("startRecording");
+    ALOGE("startRecording");
     mRecordingLock.lock();
     mRecordingEnabled = true;
 
     mParameters.getPreviewSize(&mPreviewWidth, &mPreviewHeight);
-    LOGD("getPreviewSize width:%d,height:%d",mPreviewWidth,mPreviewHeight);
+    ALOGD("getPreviewSize width:%d,height:%d",mPreviewWidth,mPreviewHeight);
 
     mRecordingLock.unlock();
     return NO_ERROR;
@@ -503,7 +503,7 @@ status_t CameraHardware::startRecording()
 
 void CameraHardware::stopRecording()
 {
-    LOGE("stopRecording");
+    ALOGE("stopRecording");
     mRecordingLock.lock();
 
     mRecordingEnabled = false;
@@ -528,7 +528,7 @@ void CameraHardware::releaseRecordingFrame(const void* opaque)
 int CameraHardware::beginAutoFocusThread(void *cookie)
 {
     CameraHardware *c = (CameraHardware *)cookie;
-    LOGD("beginAutoFocusThread");
+    ALOGD("beginAutoFocusThread");
     return c->autoFocusThread();
 }
 
@@ -543,7 +543,7 @@ status_t CameraHardware::autoFocus()
 {
     Mutex::Autolock lock(mLock);
     if (createThread(beginAutoFocusThread, this) == false) {
-        LOGE("beginAutoFocusThread failed!!");
+        ALOGE("beginAutoFocusThread failed!!");
         return UNKNOWN_ERROR;
     }
 
@@ -558,7 +558,7 @@ status_t CameraHardware::cancelAutoFocus()
 int CameraHardware::beginPictureThread(void *cookie)
 {
     CameraHardware *c = (CameraHardware *)cookie;
-    LOGE("begin Picture Thread");
+    ALOGE("begin Picture Thread");
     return c->pictureThread();
 }
 
@@ -577,12 +577,12 @@ int CameraHardware::pictureThread()
     char devnode[12];
     camera_memory_t* picture = NULL;
 
-    LOGV("Picture Thread:%d",mMsgEnabled);
+    ALOGV("Picture Thread:%d",mMsgEnabled);
     if (mMsgEnabled & CAMERA_MSG_SHUTTER)
         mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
 
      mParameters.getPictureSize(&w, &h);
-     LOGV("Picture Size: Width = %d \t Height = %d", w, h);
+     ALOGV("Picture Size: Width = %d \t Height = %d", w, h);
 
      int width, height;
      mParameters.getPictureSize(&width, &height);
@@ -598,19 +598,19 @@ int CameraHardware::pictureThread()
 
      ret = mCamera->Configure(mPreviewWidth,mPreviewHeight,PIXEL_FORMAT,30);
      if(ret < 0) {
-	     LOGE("Fail to configure camera device");
+	     ALOGE("Fail to configure camera device");
 	     return INVALID_OPERATION;
      }
 
      ret = mCamera->BufferMap();
      if (ret) {
-         LOGE("Camera BufferMap fail: %s", strerror(errno));
+         ALOGE("Camera BufferMap fail: %s", strerror(errno));
          return UNKNOWN_ERROR;
      }
 
      ret = mCamera->StartStreaming();
      if (ret) {
-        LOGE("Camera StartStreaming fail: %s", strerror(errno));
+        ALOGE("Camera StartStreaming fail: %s", strerror(errno));
         mCamera->Uninit();
         mCamera->Close();
         return UNKNOWN_ERROR;
@@ -618,7 +618,7 @@ int CameraHardware::pictureThread()
 
      //TODO xxx : Optimize the memory capture call. Too many memcpy
      if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
-        LOGV ("mJpegPictureCallback");
+        ALOGV ("mJpegPictureCallback");
         picture = mCamera->GrabJpegFrame(mRequestMemory);
         mDataCb(CAMERA_MSG_COMPRESSED_IMAGE,picture,0,NULL ,mCallbackCookie);
     }
@@ -656,50 +656,50 @@ status_t CameraHardware::setParameters(const CameraParameters& params)
 	int framerate = 0;
 	params.getPreviewSize(&width,&height);
 
-	LOGD("Set Parameter...!! ");
+	ALOGD("Set Parameter...!! ");
 
-	LOGD("PreviewFormat %s", params.getPreviewFormat());
+	ALOGD("PreviewFormat %s", params.getPreviewFormat());
 	if ( params.getPreviewFormat() != NULL ) {
 		if (strcmp(params.getPreviewFormat(), (const char *) CameraParameters::PIXEL_FORMAT_YUV422SP) != 0) {
-			LOGE("Only yuv422sp preview is supported");
+			ALOGE("Only yuv422sp preview is supported");
 			return -EINVAL;
 		}
 	}
 
-	LOGD("PictureFormat %s", params.getPictureFormat());
+	ALOGD("PictureFormat %s", params.getPictureFormat());
 	if ( params.getPictureFormat() != NULL ) {
 		if (strcmp(params.getPictureFormat(), (const char *) CameraParameters::PIXEL_FORMAT_JPEG) != 0) {
-			LOGE("Only jpeg still pictures are supported");
+			ALOGE("Only jpeg still pictures are supported");
 			return -EINVAL;
 		}
 	}
 
 	/* validate preview size */
 	params.getPreviewSize(&width, &height);
-	LOGD("preview width:%d,height:%d",width,height);
+	ALOGD("preview width:%d,height:%d",width,height);
 	if ( validateSize(width, height, supportedPreviewRes, ARRAY_SIZE(supportedPreviewRes)) == false ) {
-        LOGE("Preview size not supported");
+        ALOGE("Preview size not supported");
         return -EINVAL;
     }
 
     /* validate picture size */
 	params.getPictureSize(&width, &height);
-	LOGD("picture width:%d,height:%d",width,height);
+	ALOGD("picture width:%d,height:%d",width,height);
 	if (validateSize(width, height, supportedPictureRes, ARRAY_SIZE(supportedPictureRes)) == false ) {
-        LOGE("Picture size not supported");
+        ALOGE("Picture size not supported");
         return -EINVAL;
     }
 
     framerate = params.getPreviewFrameRate();
-    LOGD("FRAMERATE %d", framerate);
+    ALOGD("FRAMERATE %d", framerate);
 
     mParameters = params;
 
     mParameters.getPictureSize(&width, &height);
-    LOGD("Picture Size by CamHAL %d x %d", width, height);
+    ALOGD("Picture Size by CamHAL %d x %d", width, height);
 
     mParameters.getPreviewSize(&width, &height);
-    LOGD("Preview Resolution by CamHAL %d x %d", width, height);
+    ALOGD("Preview Resolution by CamHAL %d x %d", width, height);
 
     return NO_ERROR;
 }
