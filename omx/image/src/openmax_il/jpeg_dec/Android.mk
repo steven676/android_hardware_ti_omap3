@@ -1,4 +1,3 @@
-ifeq ($(BUILD_JPEG_DECODER),1)
 LOCAL_PATH:= $(call my-dir)
 
 include $(CLEAR_VARS)
@@ -22,7 +21,6 @@ LOCAL_MODULE:= libOMX.TI.JPEG.decoder
 LOCAL_MODULE_TAGS := optional
 
 include $(BUILD_SHARED_LIBRARY)
-endif
 
 #########################################################
 ifeq ($(BUILD_JPEG_DEC_TEST),1)
